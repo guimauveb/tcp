@@ -1,4 +1,4 @@
-// NOTE - When the tcp packet is not properly routed (wrong destination port), the remote instance sends a RST with SEQ == ACK
+// NOTE - When the tcp segment is not properly routed (wrong destination port), the remote instance sends a RST with SEQ == ACK
 //        3 0.475377651  192.168.0.1 → 192.168.0.2  TCP 64 35688 → 5355 [SYN] Seq=0 Win=64240 Len=0 MSS=1460 SACK_PERM TSval=2418554181 TSecr=0 WS=128 TFO=R
 //        4 0.475390621  192.168.0.2 → 192.168.0.1  TCP 40 35688 → 5355 [SYN, ACK] Seq=0 Ack=1 Win=10 Len=0
 //        5 0.475399731  192.168.0.1 → 192.168.0.2  TCP 40 5355 → 35688 [RST] Seq=1 Win=0 Len=0
@@ -341,70 +341,11 @@ impl TransmissionControlBlock {
         Ok(())
     }
 
-    // TODO - Merge with on_packet
-    pub fn accept<'packet>(
-        nic: &mut Iface,
-        ip_header: Ipv4HeaderSlice<'packet>,
-        tcp_header: TcpHeaderSlice<'packet>,
-        _data: &'packet [u8],
-    ) -> Result<Option<Self>, io::Error> {
-        if tcp_header.rst() {
-            return Ok(None);
-        }
-
-        // Only expects SYN packet
-        if !tcp_header.syn() {
-            return Ok(None);
-        }
-        let snd = SendSequenceSpace::default();
-        let rcv = RecvSequenceSpace {
-            nxt: tcp_header.sequence_number() + 1,
-            wnd: tcp_header.window_size(),
-            irs: tcp_header.sequence_number(),
-            up: tcp_header.urg(),
-        };
-        let (local, remote) = (
-            Socket {
-                address: ip_header.destination_addr(),
-                port: tcp_header.source_port(),
-            },
-            Socket {
-                address: ip_header.source_addr(),
-                port: tcp_header.destination_port(),
-            },
-        );
-
-        let mut syn_ack = TcpHeader::new(remote.port, local.port, snd.iss, snd.wnd);
-        let mut ip_header = Ipv4Header::new(
-            syn_ack.header_len(),
-            TTL,
-            IpTrafficClass::Tcp,
-            local.address.octets(),
-            remote.address.octets(),
-        );
-        // TCP A                                                TCP B
-        // ...
-        // 3. ESTABLISHED <-- <SEQ=300><ACK=101><CTL=SYN,ACK>  <-- SYN-RECEIVED
-        syn_ack.acknowledgment_number = rcv.nxt;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        let mut tcb = Self {
-            state: State::SynReceived,
-            snd,
-            rcv,
-            local,
-            remote,
-        };
-        tcb.write(nic, &mut syn_ack, &mut ip_header, &[])?;
-
-        Ok(Some(tcb))
-    }
-
-    fn send_rst<'packet>(
+    fn send_rst<'segment>(
         &mut self,
         nic: &mut Iface,
-        tcp_header: TcpHeaderSlice<'packet>,
-        ip_header: Ipv4HeaderSlice<'packet>,
+        tcp_header: TcpHeaderSlice<'segment>,
+        ip_header: Ipv4HeaderSlice<'segment>,
         data: &[u8],
     ) -> io::Result<()> {
         eprintln!("RST implementation incomplete");
@@ -460,7 +401,7 @@ impl TransmissionControlBlock {
 
         // TODO
         // nic.send();
-        eprintln!("Send RST packet to nic");
+        eprintln!("Send RST segment to nic");
 
         Ok(())
     }
@@ -469,11 +410,11 @@ impl TransmissionControlBlock {
     //   1) The user initiates by telling the TCP to CLOSE the connection
     //   2) The remote TCP initiates by sending a FIN control signal
     //   3) Both users CLOSE simultaneously
-    fn close<'packet>(
+    fn close<'segment>(
         &mut self,
         nic: &mut Iface,
-        tcp_header: TcpHeaderSlice<'packet>,
-        ip_header: Ipv4HeaderSlice<'packet>,
+        tcp_header: TcpHeaderSlice<'segment>,
+        ip_header: Ipv4HeaderSlice<'segment>,
     ) {
         let mut fin = TcpHeader::new(self.local.port, self.remote.port, 0, 0);
         fin.fin = true;
@@ -551,21 +492,18 @@ impl TransmissionControlBlock {
     //      - Reset Processing
     //      - Retransmissions
     //      - Return approriate errors instead ok Ok()'s
-    pub fn on_packet<'packet>(
+    pub fn on_segment<'segment>(
         &mut self,
         nic: &mut Iface,
-        ip_header: Ipv4HeaderSlice<'packet>,
-        tcp_header: TcpHeaderSlice<'packet>,
-        data: &'packet [u8],
+        ip_header: Ipv4HeaderSlice<'segment>,
+        tcp_header: TcpHeaderSlice<'segment>,
+        data: &'segment [u8],
     ) -> io::Result<()> {
-        // SND.UNA = oldest unacknowledged sequence number
-        // SND.NXT = next sequence number to be sent
+        println!("SEGMENT ARRIVES");
         // SEG.ACK = acknowledgment from the receiving TCP (next sequence number expected by the receiving TCP)
         // SEG.SEQ = first sequence number of a segment
         // SEG.LEN = the number of octets occupied by the data in the segment (counting SYN and FIN)
-        let (snd_una, snd_nxt, seg_ack, seg_seq, mut seg_len) = (
-            self.snd.una,
-            self.snd.nxt,
+        let (seg_ack, seg_seq, mut seg_len) = (
             tcp_header.acknowledgment_number(),
             tcp_header.sequence_number(),
             data.len() as u32,
@@ -576,125 +514,174 @@ impl TransmissionControlBlock {
         if tcp_header.fin() {
             seg_len += 1;
         }
-        let (rcv_nxt, rcv_wnd, rcv_nxt_wnd) = (
-            self.rcv.nxt,
-            self.rcv.wnd,
-            self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
-        );
-        if !self.is_segment_acceptable(seg_len, rcv_wnd, seg_seq, rcv_nxt, rcv_nxt_wnd) {
-            //dbg!("Unacceptable segment");
-            // TODO - If not acceptable, send acknowledgment (unless the RST bit is set)
-            // Drop the segment and return.
-            return Ok(());
-        }
-
-        // SEG.SEQ+SEG.LEN-1 = last sequence number occupied by the incoming segment
-        // So SEG.SEQ+SEG.LEN is the next expected sequence number.
-        // When the receiver accepts a segment it advances RCV.NXT and sends an acknowledgment.
-        // TODO - Make sure this gets ACKed.
-        self.rcv.nxt = seg_seq.wrapping_add(seg_len);
-
-        // A new acknowledgment (called an "acceptable ack"), is one for which the inequality below holds:
-        // SND.UNA < SEG.ACK =< SND.NXT
-        // XXX - Not sure if this check should only be done when there is no data
-        if data.is_empty() && !is_between_wrapped(snd_una, seg_ack, snd_nxt.wrapping_add(1)) {
-            //dbg!("Unacceptable ack");
-            _ = self.send_rst(nic, tcp_header, ip_header, data);
-            return Ok(());
-        }
-        // 3.7 Data communication.
-        // The sender of data keeps track of the oldest unacknowledged sequence number in the variable SND.UNA
-        // SEG.ACK is equal to the last byte the remote TCP acknowledged + 1, so the first unacknowledged byte.
-        self.snd.una = seg_ack;
 
         match self.state {
-            State::LastAck => {
-                // TODO - Check send space?
-                // Closing a connection: https://datatracker.ietf.org/doc/html/rfc793#section-3.5
-                // Case 2: The remote TCP initiates by sending a FIN control signal.
-                // We are TCP B here:
-                //       TCP A                                                TCP B
-                // 5.  TIME-WAIT   --> <SEQ=101><ACK=301><CTL=ACK>      --> CLOSED
-                println!("Connectin closing");
-                self.state = State::Closed;
-            }
-            State::SynReceived => {
-                if !tcp_header.ack() {
+            // 3.10.7.2.  LISTEN STATE
+            State::Listen => {
+                // First, check for a RST:
+                // An incoming RST segment could not be valid since it could not
+                // have been sent in response to anything sent by this incarnation
+                // of the connection.  An incoming RST should be ignored.  Return.
+                if tcp_header.rst() {
                     return Ok(());
                 }
-                // 4.  ESTABLISHED --> <SEQ=101><ACK=301><CTL=ACK>       --> ESTABLISHED
-                self.state = State::Established;
-                // TODO - Assertions not passing?
-                // assert_eq!(seg_ack, snd_nxt);
-                // assert_eq!(seg_seq, rcv_nxt);
-                // assert!(tcp_header.ack());
-                // assert!(!tcp_header.syn());
-                // println!("4. assertions passed!");
 
-                // TODO - Closing the connection immediatly for now
-                {
-                    println!("Closing connection!");
-                    // let mut tcp_header =
-                    //     TcpHeader::new(self.source_port, self.destination_port, seg_ack, 10);
-                    // self.state = State::FinWait1;
-                    // tcp_header.fin = true;
-                    // let mut ip_header = Ipv4Header::new(
-                    //     tcp_header.header_len(),
-                    //     TTL,
-                    //     IpTrafficClass::Tcp,
-                    //     self.source_address,
-                    //     self.destination_address,
-                    // );
-                    // self.write(nic, &mut tcp_header, &mut ip_header, &[])?;
-                }
-            }
-            State::Established => {
-                // TCP A                                                TCP B
-                // ...
-                //   5.  ESTABLISHED --> <SEQ=101><ACK=301><CTL=ACK><DATA> --> ESTABLISHED
-                // if !tcp_header.fin() && !data.is_empty() {
-                //     eprintln!("Data processing not implemented: {data:?}");
-                // }
-
-                // Closing a connection: https://datatracker.ietf.org/doc/html/rfc793#section-3.5
-                // Case 2: The remote TCP initiates by sending a FIN control signal.
-                // We are TCP B here:
-                //       TCP A                                                TCP B
-                //
-                //   1.  ESTABLISHED                                          ESTABLISHED
-                //
-                //   2.  (Close)
-                //       FIN-WAIT-1  --> <SEQ=100><ACK=300><CTL=FIN,ACK>  --> CLOSE-WAIT
-                //
-                //   3.  FIN-WAIT-2  <-- <SEQ=300><ACK=101><CTL=ACK>      <-- CLOSE-WAIT
-                if tcp_header.fin() {
-                    self.state = State::CloseWait;
-                    // TODO - Send remaining data it there is some?
-                    let mut tcp_header =
+                // Second, check for an ACK:
+                // Any acknowledgment is bad if it arrives on a connection still
+                // in the LISTEN state.  An acceptable reset segment should be
+                // formed for any arriving ACK-bearing segment.  The RST should be
+                // formatted as follows: <SEQ=SEG.ACK><CTL=RST>
+                if tcp_header.ack() {
+                    let mut response =
                         TcpHeader::new(self.local.port, self.remote.port, seg_ack, 0);
-                    tcp_header.ack = true;
-                    tcp_header.acknowledgment_number = seg_seq + 1;
-                    // TODO - Update send space?
-
+                    response.rst = true;
                     let mut ip_header = Ipv4Header::new(
-                        tcp_header.header_len(),
+                        response.header_len(),
                         TTL,
                         IpTrafficClass::Tcp,
                         self.local.address.octets(),
                         self.remote.address.octets(),
                     );
-                    self.write(nic, &mut tcp_header, &mut ip_header, &[])?;
+                    self.write(nic, &mut response, &mut ip_header, &[])?;
 
-                    // 4.                                                       (Close)
-                    //     TIME-WAIT   <-- <SEQ=300><ACK=101><CTL=FIN,ACK>  <-- LAST-ACK
-                    self.state = State::LastAck;
-                    tcp_header.fin = true;
-                    self.write(nic, &mut tcp_header, &mut ip_header, &[])?;
+                    return Ok(());
+                }
+
+                // Third, check for a SYN:
+                // -  If the SYN bit is set, check the security.  If the security/
+                //    compartment on the incoming segment does not exactly match the
+                //    security/compartment in the TCB, then send a reset and return.
+                //    <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+                if tcp_header.syn() {
+                    // TODO - Check security
+                    if false {
+                        let mut response =
+                            TcpHeader::new(self.local.port, self.remote.port, self.snd.iss, 0);
+                        response.acknowledgment_number =
+                            tcp_header.sequence_number().wrapping_add(seg_len);
+                        response.rst = true;
+                        response.ack = true;
+
+                        let mut ip_header = Ipv4Header::new(
+                            response.header_len(),
+                            TTL,
+                            IpTrafficClass::Tcp,
+                            self.local.address.octets(),
+                            self.remote.address.octets(),
+                        );
+                        self.write(nic, &mut response, &mut ip_header, &[])?;
+                        return Ok(());
+                    }
+
+                    // -  Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ, and any other
+                    //    control or text should be queued for processing later.  ISS
+                    //    should be selected and a SYN segment sent of the form:
+                    //       <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+                    self.rcv.nxt = seg_seq.wrapping_add(1);
+                    self.rcv.irs = seg_seq;
+
+                    let mut response =
+                        TcpHeader::new(self.local.port, self.remote.port, self.snd.iss, 0);
+                    response.acknowledgment_number = self.rcv.nxt;
+                    response.syn = true;
+                    response.ack = true;
+
+                    // -  SND.NXT is set to ISS+1 and SND.UNA to ISS.  The connection
+                    //    state should be changed to SYN-RECEIVED.  Note that any other
+                    //    incoming control or data (combined with SYN) will be processed
+                    //    in the SYN-RECEIVED state, but processing of SYN and ACK should
+                    //    not be repeated.  If the listen was not fully specified (i.e.,
+                    //    the remote socket was not fully specified), then the
+                    //    unspecified fields should be filled in now.
+                    self.snd.nxt = self.snd.iss.wrapping_add(1);
+                    self.snd.una = self.snd.iss;
+                    self.state = State::SynReceived;
+                    let mut ip_header = Ipv4Header::new(
+                        response.header_len(),
+                        TTL,
+                        IpTrafficClass::Tcp,
+                        self.local.address.octets(),
+                        self.remote.address.octets(),
+                    );
+                    self.write(nic, &mut response, &mut ip_header, &[])?;
+
+                    // TODO - Process incoming control and data
+                    if !data.is_empty() {
+                        eprintln!("Data processing not implemented");
+                    }
+                    return Ok(());
+                }
+
+                // Fourth, other data or control:
+                // -  This should not be reached.  Drop the segment and return.  Any
+                //    other control or data-bearing segment (not containing SYN) must
+                //    have an ACK and thus would have been discarded by the ACK
+                //    processing in the second step, unless it was first discarded by
+                //    RST checking in the first step.
+            }
+            // 3.10.7.3.  SYN-SENT STATE
+            State::SynSent => {
+                if tcp_header.ack() {
+                    let (iss, seg_ack, snd_nxt, rst) = (
+                        self.snd.iss,
+                        tcp_header.acknowledgment_number(),
+                        self.snd.nxt,
+                        tcp_header.rst(),
+                    );
+
+                    // If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless
+                    // the RST bit is set, if so drop the segment and return)
+                    //    <SEQ=SEG.ACK><CTL=RST>
+                    // and discard the segment.  Return.
+                    if !is_between_wrapped(iss.wrapping_add(1), seg_ack, snd_nxt) {
+                        if rst {
+                            return Ok(());
+                        }
+                        let mut response =
+                            TcpHeader::new(self.local.port, self.remote.port, seg_ack, 0);
+                        response.rst = true;
+                        let mut ip_header = Ipv4Header::new(
+                            response.header_len(),
+                            TTL,
+                            IpTrafficClass::Tcp,
+                            self.local.address.octets(),
+                            self.remote.address.octets(),
+                        );
+                        self.write(nic, &mut response, &mut ip_header, &[])?;
+                    }
+
+                    // If SND.UNA < SEG.ACK =< SND.NXT, then the ACK is acceptable.
+                    // Some deployed TCP code has used the check SEG.ACK == SND.NXT
+                    // (using "==" rather than "=<"), but this is not appropriate
+                    // when the stack is capable of sending data on the SYN because
+                    // the TCP peer may not accept and acknowledge all of the data
+                    // on the SYN.
+                    let snd_una = self.snd.una;
+                    if !is_between_wrapped(snd_una, seg_ack, snd_nxt.wrapping_add(1)) {
+                        // Unacceptable ACK.
+                        return Ok(());
+                    }
+
+                    // TODO
+                    // If the RST bit is set,
+
+                    //  A potential blind reset attack is described in RFC 5961 [9].
+                    //  The mitigation described in that document has specific
+                    //  applicability explained therein, and is not a substitute for
+                    //  cryptographic protection (e.g., IPsec or TCP-AO).  A TCP
+                    //  implementation that supports the mitigation described in RFC
+                    //  5961 SHOULD first check that the sequence number exactly
+                    //  matches RCV.NXT prior to executing the action in the next
+                    //  paragraph.
+
+                    //  If the ACK was acceptable, then signal to the user "error:
+                    //  connection reset", drop the segment, enter CLOSED state,
+                    //  delete TCB, and return.  Otherwise (no ACK), drop the
+                    //  segment and return.
                 }
             }
-            _ => {
-                // State::Listen is the state before a connection is created, State::Closed after it is closed.
-                return Ok(());
+            state => {
+                eprintln!("Implement {state:?} case");
             }
         }
 
