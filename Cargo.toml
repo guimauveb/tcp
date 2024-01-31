@@ -1,0 +1,12 @@
+[package]
+name = "tcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# NOTE - Test only
+tun-tap = "0.1"
+etherparse = "0.8"
+thiserror = "1.0"
+hashbrown = "0.14"
+log = "0.4"
