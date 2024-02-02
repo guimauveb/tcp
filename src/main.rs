@@ -7,7 +7,7 @@ use {
     error::Error,
     etherparse::{Ipv4HeaderSlice, TcpHeaderSlice},
     hashbrown::{hash_map::Entry, HashMap},
-    std::{io, net::Ipv4Addr},
+    std::net::Ipv4Addr,
     tcp::{State, TransmissionControlBlock},
     tun_tap::{Iface, Mode},
 };
@@ -32,7 +32,7 @@ fn listen_remote(
     nic: &mut Iface,
     buf: &mut [u8],
     connections: &mut HashMap<Connection, TransmissionControlBlock>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     //nic.set_non_blocking()?;
     // TODO - Match errors
     let Ok(nbytes) = nic.recv(buf) else {
@@ -61,7 +61,13 @@ fn listen_remote(
                 match connections.entry(connection) {
                     Entry::Occupied(mut entry) => {
                         let tcb = entry.get_mut();
-                        tcb.on_segment(nic, ip_header, tcp_header, &buf[data_offset..nbytes])?;
+                        if let Err(err) =
+                            tcb.on_segment(nic, ip_header, tcp_header, &buf[data_offset..nbytes])
+                        {
+                            if let Error::ConnectionReset = err {
+                                entry.remove_entry();
+                            }
+                        }
                     }
                     Entry::Vacant(_entry) => {
                         // 3.10.7.1.  CLOSED STATE
@@ -179,7 +185,7 @@ pub fn status(
     }
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Error> {
     let mut connections: HashMap<Connection, tcp::TransmissionControlBlock> = HashMap::default();
     let mut nic = Iface::without_packet_info("tun0", Mode::Tun)?;
     let mut buf = [0u8; MTU + 4];

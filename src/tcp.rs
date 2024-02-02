@@ -69,14 +69,12 @@ pub enum State {
     /// of its connection termination request and to avoid new connections being impacted by delayed segments
     /// from previous connections.
     TimeWait,
-    /// Represents no connection state at all.
-    Closed,
 }
 
 impl State {
     fn is_synchronized(&self) -> bool {
         match self {
-            Self::Closed | Self::Listen | Self::SynSent | Self::SynReceived => false,
+            Self::Listen | Self::SynSent | Self::SynReceived => false,
             Self::Established
             | Self::FinWait1
             | Self::FinWait2
@@ -460,27 +458,27 @@ impl TransmissionControlBlock {
     ) -> bool {
         if seg_len == 0 {
             if rcv_wnd == 0 && seg_seq != rcv_nxt {
-                dbg!("Unacceptable segment: test case 1 failed");
+                eprintln!("Unacceptable segment: test case 1 failed");
                 return false;
             } else if rcv_wnd > 0
                 && !is_between_wrapped(rcv_nxt.wrapping_sub(1), seg_seq, rcv_nxt_wnd)
             {
-                dbg!("Unacceptable segment: test case 2 failed");
+                eprintln!("Unacceptable segment: test case 2 failed");
                 return false;
             }
         } else if seg_len > 0 {
             if rcv_wnd == 0 {
-                dbg!("Unacceptable segment: test case 3");
+                eprintln!("Unacceptable segment: test case 3");
                 return false;
             } else if rcv_wnd > 0
                 && !(is_between_wrapped(rcv_nxt.wrapping_sub(1), seg_seq, rcv_nxt_wnd)
-                    && is_between_wrapped(
+                    || is_between_wrapped(
                         rcv_nxt.wrapping_sub(1),
-                        seg_seq.wrapping_add(seg_len - 1),
+                        seg_seq.wrapping_add(seg_len).wrapping_sub(1),
                         rcv_nxt_wnd,
                     ))
             {
-                dbg!("Unacceptable segment: test case 2 failed");
+                eprintln!("Unacceptable segment: test case 2 failed");
                 return false;
             }
         }
@@ -498,8 +496,7 @@ impl TransmissionControlBlock {
         ip_header: Ipv4HeaderSlice<'segment>,
         tcp_header: TcpHeaderSlice<'segment>,
         data: &'segment [u8],
-    ) -> io::Result<()> {
-        println!("SEGMENT ARRIVES");
+    ) -> Result<(), Error> {
         // SEG.ACK = acknowledgment from the receiving TCP (next sequence number expected by the receiving TCP)
         // SEG.SEQ = first sequence number of a segment
         // SEG.LEN = the number of octets occupied by the data in the segment (counting SYN and FIN)
@@ -621,19 +618,13 @@ impl TransmissionControlBlock {
             }
             // 3.10.7.3.  SYN-SENT STATE
             State::SynSent => {
+                let (rst, seg_wnd) = (tcp_header.rst(), tcp_header.window_size());
                 if tcp_header.ack() {
-                    let (iss, seg_ack, snd_nxt, rst) = (
-                        self.snd.iss,
-                        tcp_header.acknowledgment_number(),
-                        self.snd.nxt,
-                        tcp_header.rst(),
-                    );
-
                     // If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless
                     // the RST bit is set, if so drop the segment and return)
                     //    <SEQ=SEG.ACK><CTL=RST>
                     // and discard the segment.  Return.
-                    if !is_between_wrapped(iss.wrapping_add(1), seg_ack, snd_nxt) {
+                    if !is_between_wrapped(self.snd.iss.wrapping_add(1), seg_ack, self.snd.nxt) {
                         if rst {
                             return Ok(());
                         }
@@ -657,31 +648,150 @@ impl TransmissionControlBlock {
                     // the TCP peer may not accept and acknowledge all of the data
                     // on the SYN.
                     let snd_una = self.snd.una;
-                    if !is_between_wrapped(snd_una, seg_ack, snd_nxt.wrapping_add(1)) {
+                    if !is_between_wrapped(snd_una, seg_ack, self.snd.nxt.wrapping_add(1)) {
                         // Unacceptable ACK.
                         return Ok(());
                     }
+                }
 
-                    // TODO
-                    // If the RST bit is set,
+                // TODO - Blind reset attack mitigation?
+                // If the RST bit is set,
+                //  A potential blind reset attack is described in RFC 5961 [9].
+                //  The mitigation described in that document has specific
+                //  applicability explained therein, and is not a substitute for
+                //  cryptographic protection (e.g., IPsec or TCP-AO).  A TCP
+                //  implementation that supports the mitigation described in RFC
+                //  5961 SHOULD first check that the sequence number exactly
+                //  matches RCV.NXT prior to executing the action in the next
+                //  paragraph.
 
-                    //  A potential blind reset attack is described in RFC 5961 [9].
-                    //  The mitigation described in that document has specific
-                    //  applicability explained therein, and is not a substitute for
-                    //  cryptographic protection (e.g., IPsec or TCP-AO).  A TCP
-                    //  implementation that supports the mitigation described in RFC
-                    //  5961 SHOULD first check that the sequence number exactly
-                    //  matches RCV.NXT prior to executing the action in the next
-                    //  paragraph.
+                //  If the ACK was acceptable, then signal to the user "error:
+                //  connection reset", drop the segment, enter CLOSED state,
+                //  delete TCB, and return.  Otherwise (no ACK), drop the
+                //  segment and return.
+                if rst && seg_seq == self.rcv.nxt {
+                    if tcp_header.ack() {
+                        return Err(Error::ConnectionReset);
+                    }
+                    return Ok(());
+                }
 
-                    //  If the ACK was acceptable, then signal to the user "error:
-                    //  connection reset", drop the segment, enter CLOSED state,
-                    //  delete TCB, and return.  Otherwise (no ACK), drop the
-                    //  segment and return.
+                // TODO - Check the security
+                // If the security/compartment in the segment does not exactly
+                // match the security/compartment in the TCB, send a reset:
+                // If there is an ACK,
+                // <SEQ=SEG.ACK><CTL=RST>
+                // Otherwise,
+                // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
+                // If a reset was sent, discard the segment and return.
+
+                // If the SYN bit is on and the security/compartment is
+                // acceptable, then RCV.NXT is set to SEG.SEQ+1, IRS is set to
+                // SEG.SEQ.  SND.UNA should be advanced to equal SEG.ACK (if there
+                // is an ACK), and any segments on the retransmission queue that
+                // are thereby acknowledged should be removed.
+
+                // Fourth, check the SYN bit:
+                // TODO - Assert this affirmation
+                // This step should be reached only if the ACK is ok, or there is
+                // no ACK, and the segment did not contain a RST.
+
+                // If the SYN bit is on and the security/compartment is
+                // acceptable, then RCV.NXT is set to SEG.SEQ+1, IRS is set to
+                // SEG.SEQ.  SND.UNA should be advanced to equal SEG.ACK (if there
+                // is an ACK).
+                if tcp_header.syn() {
+                    self.rcv.nxt = seg_seq.wrapping_add(1);
+                    self.rcv.irs = seg_seq;
+                    if tcp_header.ack() {
+                        self.snd.una = seg_ack;
+                    }
+                    // TODO - Any segments on the retransmission queue that are thereby acknowledged should be removed.
+
+                    // If SND.UNA > ISS (our SYN has been ACKed), change the
+                    // connection state to ESTABLISHED, form an ACK segment
+                    // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                    if self.snd.una > self.snd.iss {
+                        self.state = State::Established;
+                        let mut response =
+                            TcpHeader::new(self.local.port, self.remote.port, self.snd.iss, 0);
+                        response.ack = true;
+                        response.acknowledgment_number = self.rcv.nxt;
+                        let mut ip_header = Ipv4Header::new(
+                            response.header_len(),
+                            TTL,
+                            IpTrafficClass::Tcp,
+                            self.local.address.octets(),
+                            self.remote.address.octets(),
+                        );
+                        self.write(nic, &mut response, &mut ip_header, &[])?;
+                    // TODO - Data or controls that were queued for
+                    // transmission MAY be included.  Some TCP implementations
+                    // suppress sending this segment when the received segment
+                    // contains data that will anyways generate an acknowledgment in
+                    // the later processing steps, saving this extra acknowledgment of
+                    // the SYN from being sent.  If there are other controls or text
+                    // in the segment, then continue processing at the sixth step
+                    // under Section 3.10.7.4 where the URG bit is checked; otherwise,
+                    // return.
+                    } else {
+                        // Otherwise, enter SYN-RECEIVED, form a SYN,ACK segment
+                        // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+                        self.state = State::SynReceived;
+                        let mut response =
+                            TcpHeader::new(self.local.port, self.remote.port, self.snd.iss, 0);
+                        response.syn = true;
+                        response.ack = true;
+                        response.acknowledgment_number = self.rcv.nxt;
+                        let mut ip_header = Ipv4Header::new(
+                            response.header_len(),
+                            TTL,
+                            IpTrafficClass::Tcp,
+                            self.local.address.octets(),
+                            self.remote.address.octets(),
+                        );
+                        self.write(nic, &mut response, &mut ip_header, &[])?;
+                        // Set the variables:
+                        //     SND.WND <- SEG.WND
+                        //     SND.WL1 <- SEG.SEQ
+                        //     SND.WL2 <- SEG.ACK
+                        self.snd.wnd = seg_wnd;
+                        self.snd.wl1 = seg_seq;
+                        self.snd.wl2 = seg_ack;
+                        //  TODO - If there are other controls or text in the segment, queue them
+                        //  for processing after the ESTABLISHED state has been reached,
+                        //  return.
+
+                        // NOTE - It is legal to send and receive application data on
+                        // SYN segments (this is the "text in the segment" mentioned
+                        // above).  There has been significant misinformation and
+                        // misunderstanding of this topic historically.  Some firewalls
+                        // and security devices consider this suspicious.  However, the
+                        // capability was used in T/TCP [21] and is used in TCP Fast Open
+                        // (TFO) [48], so is important for implementations and network
+                        // devices to permit.
+                    }
+
+                    return Ok(());
                 }
             }
-            state => {
-                eprintln!("Implement {state:?} case");
+            State::SynReceived
+            | State::Established
+            | State::FinWait1
+            | State::FinWait2
+            | State::CloseWait
+            | State::Closing
+            | State::LastAck
+            | State::TimeWait => {
+                if !self.is_segment_acceptable(
+                    seg_len,
+                    self.rcv.wnd,
+                    seg_seq,
+                    self.rcv.nxt,
+                    self.rcv.nxt.wrapping_add(self.rcv.wnd.into()),
+                ) {
+                    // TODO
+                }
             }
         }
 
