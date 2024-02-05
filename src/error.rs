@@ -12,4 +12,6 @@ pub enum Error {
     ConnectionDoesNotExit,
     #[error("Connection reset")]
     ConnectionReset,
+    #[error("Connection refused")]
+    ConnectionRefused,
 }

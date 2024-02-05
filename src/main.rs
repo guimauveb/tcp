@@ -64,8 +64,13 @@ fn listen_remote(
                         if let Err(err) =
                             tcb.on_segment(nic, ip_header, tcp_header, &buf[data_offset..nbytes])
                         {
-                            if let Error::ConnectionReset = err {
-                                entry.remove_entry();
+                            match err {
+                                Error::ConnectionRefused | Error::ConnectionReset => {
+                                    entry.remove_entry();
+                                }
+                                _ => {
+                                    eprintln!("{err}");
+                                }
                             }
                         }
                     }
