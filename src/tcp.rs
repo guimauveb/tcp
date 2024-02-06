@@ -120,7 +120,7 @@ struct SendSequenceSpace {
     /// Send next
     nxt: u32,
     /// Send window
-    wnd: u16,
+    wnd: Window,
     /// Send urgent pointer
     up: bool,
     /// Segment sequence number used for last window update
@@ -164,7 +164,7 @@ struct RecvSequenceSpace {
     /// Receive next
     nxt: u32,
     /// Receive window
-    wnd: u16,
+    wnd: Window,
     /// Receive urgent pointer
     up: bool,
     /// Initial receive sequence number
@@ -534,13 +534,10 @@ impl TransmissionControlBlock {
                     }
                 }
 
-                // Documentation L53->61
+                // Documentation L.53->61
                 // TODO - Blind reset attack mitigation?
 
-                //  If the ACK was acceptable, then signal to the user "error:
-                //  connection reset", drop the segment, enter CLOSED state,
-                //  delete TCB, and return.  Otherwise (no ACK), drop the
-                //  segment and return.
+                // Documentation L.64->67
                 if rst && seg_seq == self.rcv.nxt {
                     if tcp_header.ack() {
                         return Err(Error::ConnectionReset);
@@ -549,29 +546,14 @@ impl TransmissionControlBlock {
                 }
 
                 // TODO - Check the security
-                // If the security/compartment in the segment does not exactly
-                // match the security/compartment in the TCB, send a reset:
-                // If there is an ACK,
-                // <SEQ=SEG.ACK><CTL=RST>
-                // Otherwise,
-                // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
-                // If a reset was sent, discard the segment and return.
-
-                // If the SYN bit is on and the security/compartment is
-                // acceptable, then RCV.NXT is set to SEG.SEQ+1, IRS is set to
-                // SEG.SEQ.  SND.UNA should be advanced to equal SEG.ACK (if there
-                // is an ACK), and any segments on the retransmission queue that
-                // are thereby acknowledged should be removed.
+                // Documentation L.69->81
 
                 // Fourth, check the SYN bit:
                 // TODO - Assert this affirmation
                 // This step should be reached only if the ACK is ok, or there is
                 // no ACK, and the segment did not contain a RST.
 
-                // If the SYN bit is on and the security/compartment is
-                // acceptable, then RCV.NXT is set to SEG.SEQ+1, IRS is set to
-                // SEG.SEQ.  SND.UNA should be advanced to equal SEG.ACK (if there
-                // is an ACK).
+                // Documentation L.83->86
                 if tcp_header.syn() {
                     self.rcv.nxt = seg_seq.wrapping_add(1);
                     self.rcv.irs = seg_seq;
@@ -580,9 +562,7 @@ impl TransmissionControlBlock {
                     }
                     // TODO - Any segments on the retransmission queue that are thereby acknowledged should be removed.
 
-                    // If SND.UNA > ISS (our SYN has been ACKed), change the
-                    // connection state to ESTABLISHED, form an ACK segment
-                    // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                    // Documentation L88->90
                     if self.snd.una > self.snd.iss {
                         self.state = State::Established;
                         let mut response = self.get_tcp_header(self.snd.iss, 0);
@@ -590,18 +570,9 @@ impl TransmissionControlBlock {
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
                         self.write(nic, &mut response, &mut ip_header, &[])?;
-                    // TODO - Data or controls that were queued for
-                    // transmission MAY be included.  Some TCP implementations
-                    // suppress sending this segment when the received segment
-                    // contains data that will anyways generate an acknowledgment in
-                    // the later processing steps, saving this extra acknowledgment of
-                    // the SYN from being sent.  If there are other controls or text
-                    // in the segment, then continue processing at the sixth step
-                    // under Section 3.10.7.4 where the URG bit is checked; otherwise,
-                    // return.
+                    // TODO - Documentation L.92->100
                     } else {
-                        // Otherwise, enter SYN-RECEIVED, form a SYN,ACK segment
-                        // <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+                        // Documentation L.102->103
                         self.state = State::SynReceived;
                         let mut response = self.get_tcp_header(self.snd.iss, 0);
                         response.syn = true;
@@ -609,10 +580,7 @@ impl TransmissionControlBlock {
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
                         self.write(nic, &mut response, &mut ip_header, &[])?;
-                        // Set the variables:
-                        //     SND.WND <- SEG.WND
-                        //     SND.WL1 <- SEG.SEQ
-                        //     SND.WL2 <- SEG.ACK
+                        // Documentation L.105->108
                         self.snd.wnd = seg_wnd;
                         self.snd.wl1 = seg_seq;
                         self.snd.wl2 = seg_ack;
@@ -620,14 +588,7 @@ impl TransmissionControlBlock {
                         //  for processing after the ESTABLISHED state has been reached,
                         //  return.
 
-                        // NOTE - It is legal to send and receive application data on
-                        // SYN segments (this is the "text in the segment" mentioned
-                        // above).  There has been significant misinformation and
-                        // misunderstanding of this topic historically.  Some firewalls
-                        // and security devices consider this suspicious.  However, the
-                        // capability was used in T/TCP [21] and is used in TCP Fast Open
-                        // (TFO) [48], so is important for implementations and network
-                        // devices to permit.
+                        // NOTE - Documentation L.110->117
                     }
                     return Ok(());
                 }
@@ -649,65 +610,43 @@ impl TransmissionControlBlock {
                     self.rcv.nxt,
                     self.rcv.nxt.wrapping_add(self.rcv.wnd.into()),
                 ) {
-                    // If an incoming segment is not acceptable, an acknowledgment
-                    // should be sent in reply (unless the RST bit is set, if so
-                    // drop the segment and return):
-                    // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                    // Documentation L.119->122
                     if !tcp_header.rst() {
                         let mut response = self.get_tcp_header(self.snd.nxt, 0);
                         response.ack = true;
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
                         self.write(nic, &mut response, &mut ip_header, &[])?;
-                        // After sending the acknowledgment, drop the unacceptable
-                        // segment and return.
                     }
                     return Ok(());
                 }
 
-                // NOTE - RFC9293 mentions a blind reset attack mitigation approach and 3 checks to do
-                // if the mitigation is implemented. We ignore it for now as the mitigation is not
-                // implemented.
+                // NOTE - Documentation L.124->126
 
                 match self.state {
                     State::SynReceived => {
                         if tcp_header.rst() {
                             match self.initial_state {
                                 InitialState::Passive => {
-                                    // If this connection was initiated with a passive OPEN
-                                    // (i.e., came from the LISTEN state), then return this
-                                    // connection to LISTEN state and return.  The user need not
-                                    // be informed.
+                                    // Documentation L.128->131
                                     self.state = State::Listen;
                                     return Ok(());
                                 }
                                 InitialState::Active => {
-                                    // If this connection was initiated with an
-                                    // active OPEN (i.e., came from SYN-SENT state), then the
-                                    // connection was refused; signal the user "connection
-                                    // refused".  In either case, the retransmission queue
-                                    // should be flushed.  And in the active OPEN case, enter
-                                    // the CLOSED state and delete the TCB, and return.
+                                    // Documentation L.133->138
                                     // TODO - Flush retransmission queue
                                     return Err(Error::ConnectionRefused);
                                 }
                             }
                         }
                         // TODO - Check the security
-                        // If the security/compartment in the segment does not exactly
-                        // match the security/compartment in the TCB, then send a reset
-                        // and return.
+                        // Documentation L.140->142
 
-                        // Fourth, check the SYN bit:
-                        //  SYN-RECEIVED STATE
-                        //  If the connection was initiated with a passive OPEN, then
-                        //  return this connection to the LISTEN state and return.
+                        // Documentation L.144->147
                         if tcp_header.syn() && self.initial_state == InitialState::Passive {
                             self.state = State::Listen;
                             return Ok(());
                         }
-                        //  Otherwise, handle per the directions for synchronized states
-                        //  below.
                     }
                     // TODO - Synchronized states (State::is_synchronized)
                     State::Established
@@ -723,11 +662,7 @@ impl TransmissionControlBlock {
                             | State::FinWait2
                             | State::CloseWait => {
                                 if tcp_header.rst() {
-                                    // If the RST bit is set, then any outstanding RECEIVEs and
-                                    // SEND should receive "reset" responses.  All segment queues
-                                    // should be flushed.  Users should also receive an unsolicited
-                                    // general "connection reset" signal.  Enter the CLOSED state,
-                                    // delete the TCB, and return.
+                                    // Documentation L.149->153
                                     // TODO - Flush segments queues (same as retransmission queues?)
                                     return Err(Error::ConnectionReset);
                                 }
@@ -739,66 +674,71 @@ impl TransmissionControlBlock {
                             }
 
                             // TODO - Check security
-                            // If the security/compartment in the segment does not exactly
-                            // match the security/compartment in the TCB, then send a
-                            // reset; any outstanding RECEIVEs and SEND should receive
-                            // "reset" responses.  All segment queues should be flushed.
-                            // Users should also receive an unsolicited general "connection
-                            // reset" signal.  Enter the CLOSED state, delete the TCB, and
-                            // return.
-                            // Note this check is placed following the sequence check to
-                            // prevent a segment from an old connection between these port
-                            // numbers with a different security from causing an abort of the
-                            // current connection.
+                            // Documentation L.155->165
                             _ => {
                                 unimplemented!();
                             }
                         }
-                        // Fourth, check the SYN bit:
-                        // NOTE - We do not follow RFC5961 so the following paragraph does not apply.
-                        // If the SYN bit is set in these synchronized states, it may
-                        // be either a legitimate new connection attempt (e.g., in the
-                        // case of TIME-WAIT), an error where the connection should be
-                        // reset, or the result of an attack attempt, as described in
-                        // RFC 5961 [9].  For the TIME-WAIT state, new connections can
-                        // be accepted if the Timestamp Option is used and meets
-                        // expectations (per [40]).  For all other cases, RFC 5961
-                        // provides a mitigation with applicability to some situations,
-                        // though there are also alternatives that offer cryptographic
-                        // protection (see Section 7).  RFC 5961 recommends that in
-                        // these synchronized states, if the SYN bit is set,
-                        // irrespective of the sequence number, TCP endpoints MUST send
-                        // a "challenge ACK" to the remote peer:
-                        // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-                        // After sending the acknowledgment, TCP implementations MUST
-                        // drop the unacceptable segment and stop processing further.
-                        // Note that RFC 5961 and Errata ID 4772 [99] contain
-                        // additional ACK throttling notes for an implementation.
+                        // NOTE - Documentation L.167->185
 
-                        // For implementations that do not follow RFC 5961, the
-                        // original behavior described in RFC 793 follows in this
-                        // paragraph.  If the SYN is in the window it is an error: send
-                        // a reset, any outstanding RECEIVEs and SEND should receive
-                        // "reset" responses, all segment queues should be flushed, the
-                        // user should also receive an unsolicited general "connection
-                        // reset" signal, enter the CLOSED state, delete the TCB, and
-                        // return.
+                        // Documentation L.187->194
                         if tcp_header.syn() {
-                            // TODO - What sequence number to use?
+                            // XXX - What sequence number to use?
                             let mut response = self.get_tcp_header(seg_ack, 0);
                             response.rst = true;
                             let mut ip_header = self.get_ip_header(response.header_len());
                             self.write(nic, &mut response, &mut ip_header, &[])?;
                             return Err(Error::ConnectionReset);
                         }
-                        // If the SYN is not in the window, this step would not be
-                        // reached and an ACK would have been sent in the first step
-                        // (sequence number check).
+                        // Documentation L.196->198
                         unreachable!("SYN is not in the window, this step should not be reached.");
                     }
                     _ => {
                         unimplemented!();
                     }
+                }
+
+                println!("Entering fifth step");
+                // Fifth, check the ACK bit
+                // NOTE - Docunentation L.200->212
+                if tcp_header.ack() {
+                    match self.state {
+                        State::SynReceived => {
+                            if is_between_wrapped(
+                                self.snd.una,
+                                seg_ack,
+                                self.snd.nxt.wrapping_sub(1),
+                            ) {
+                                // If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
+                                // state and continue processing with the variables below
+                                // set to:
+                                //    SND.WND <- SEG.WND
+                                //    SND.WL1 <- SEG.SEQ
+                                //    SND.WL2 <- SEG.ACK
+                                self.state = State::Established;
+                                self.snd.wnd = tcp_header.window_size();
+                                self.snd.wl1 = seg_seq;
+                                self.snd.wl2 = seg_ack;
+                            } else {
+                                // If the segment acknowledgment is not acceptable, form a
+                                // reset segment
+                                //     <SEQ=SEG.ACK><CTL=RST>
+                                // and send it.
+                                let mut response = self.get_tcp_header(seg_ack, 0);
+                                response.rst = true;
+                                let mut ip_header = self.get_ip_header(response.header_len());
+                                self.write(nic, &mut response, &mut ip_header, &[])?;
+                            }
+                        }
+                        State::Established => {
+                            // TODO
+                        }
+                        _ => {
+                            unimplemented!();
+                        }
+                    }
+                } else {
+                    return Ok(());
                 }
             }
         }
