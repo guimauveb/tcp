@@ -45,9 +45,10 @@ fn listen_remote(
         }
 
         let ip_header_size = ip_header.slice().len();
-        match TcpHeaderSlice::from_slice(&buf[ip_header.slice().len()..nbytes]) {
+        match TcpHeaderSlice::from_slice(&buf[ip_header_size..nbytes]) {
             Ok(tcp_header) => {
                 let data_offset = ip_header_size + tcp_header.slice().len();
+                println!("Data offset: {data_offset}");
                 let connection = Connection {
                     local: Socket {
                         address: ip_header.destination_addr(),

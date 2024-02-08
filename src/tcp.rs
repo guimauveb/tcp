@@ -138,7 +138,7 @@ impl Default for SendSequenceSpace {
             iss,
             una: iss,
             nxt: iss + 1,
-            wnd: 10,
+            wnd: 65535,
             up: false,
             wl1: 0,
             wl2: 0,
@@ -175,7 +175,7 @@ impl Default for RecvSequenceSpace {
     fn default() -> Self {
         Self {
             nxt: 0,
-            wnd: 10,
+            wnd: 65535,
             up: false,
             irs: 0,
         }
@@ -233,7 +233,7 @@ impl TransmissionControlBlock {
     }
 
     fn get_tcp_header(&self, sequence_number: u32, window: u16) -> TcpHeader {
-        TcpHeader::new(self.remote.port, self.local.port, sequence_number, window)
+        TcpHeader::new(self.local.port, self.remote.port, sequence_number, window)
     }
 
     fn write(
@@ -244,6 +244,7 @@ impl TransmissionControlBlock {
         data: &[u8],
     ) -> io::Result<()> {
         // TODO - data can be > buf, handle backpressure/send queue.
+        //      (actually MTU - headers)
         let payload_size = std::cmp::min(MTU, data.len());
         if payload_size > MTU {
             eprintln!("Payload size > MTU, handle backpressure");
@@ -429,7 +430,7 @@ impl TransmissionControlBlock {
                         rcv_nxt_wnd,
                     ))
             {
-                eprintln!("Unacceptable segment: test case 2 failed");
+                eprintln!("Unacceptable segment: test case 4 failed");
                 return false;
             }
         }
@@ -471,7 +472,7 @@ impl TransmissionControlBlock {
                 }
                 // Documentation L.7->11
                 if tcp_header.ack() {
-                    let mut response = self.get_tcp_header(seg_ack, 0);
+                    let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
                     response.rst = true;
                     let mut ip_header = self.get_ip_header(response.header_len());
                     self.write(nic, &mut response, &mut ip_header, &[])?;
@@ -482,7 +483,7 @@ impl TransmissionControlBlock {
                     // TODO - Check security
                     let security_ok = true;
                     if !security_ok {
-                        let mut response = self.get_tcp_header(self.snd.iss, 0);
+                        let mut response = self.get_tcp_header(self.snd.iss, self.snd.wnd);
                         response.acknowledgment_number = seg_ack.wrapping_add(seg_len);
                         response.rst = true;
                         response.ack = true;
@@ -494,7 +495,7 @@ impl TransmissionControlBlock {
                     self.rcv.nxt = seg_seq.wrapping_add(1);
                     self.rcv.irs = seg_seq;
 
-                    let mut response = self.get_tcp_header(self.snd.iss, 0);
+                    let mut response = self.get_tcp_header(self.snd.iss, self.snd.wnd);
                     response.acknowledgment_number = self.rcv.nxt;
                     response.syn = true;
                     response.ack = true;
@@ -522,7 +523,7 @@ impl TransmissionControlBlock {
                         if rst {
                             return Ok(());
                         }
-                        let mut response = self.get_tcp_header(seg_ack, 0);
+                        let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
                         response.rst = true;
                         let mut ip_header = self.get_ip_header(response.header_len());
                         self.write(nic, &mut response, &mut ip_header, &[])?;
@@ -565,7 +566,7 @@ impl TransmissionControlBlock {
                     // Documentation L88->90
                     if self.snd.una > self.snd.iss {
                         self.state = State::Established;
-                        let mut response = self.get_tcp_header(self.snd.iss, 0);
+                        let mut response = self.get_tcp_header(self.snd.iss, self.snd.wnd);
                         response.ack = true;
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
@@ -574,7 +575,7 @@ impl TransmissionControlBlock {
                     } else {
                         // Documentation L.102->103
                         self.state = State::SynReceived;
-                        let mut response = self.get_tcp_header(self.snd.iss, 0);
+                        let mut response = self.get_tcp_header(self.snd.iss, self.snd.wnd);
                         response.syn = true;
                         response.ack = true;
                         response.acknowledgment_number = self.rcv.nxt;
@@ -612,7 +613,7 @@ impl TransmissionControlBlock {
                 ) {
                     // Documentation L.119->122
                     if !tcp_header.rst() {
-                        let mut response = self.get_tcp_header(self.snd.nxt, 0);
+                        let mut response = self.get_tcp_header(self.snd.nxt, self.snd.wnd);
                         response.ack = true;
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
@@ -684,65 +685,216 @@ impl TransmissionControlBlock {
                         // Documentation L.187->194
                         if tcp_header.syn() {
                             // XXX - What sequence number to use?
-                            let mut response = self.get_tcp_header(seg_ack, 0);
+                            let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
                             response.rst = true;
                             let mut ip_header = self.get_ip_header(response.header_len());
                             self.write(nic, &mut response, &mut ip_header, &[])?;
                             return Err(Error::ConnectionReset);
                         }
                         // Documentation L.196->198
-                        unreachable!("SYN is not in the window, this step should not be reached.");
+
+                        // TODO - Check FIN bit
                     }
                     _ => {
                         unimplemented!();
                     }
                 }
 
-                println!("Entering fifth step");
                 // Fifth, check the ACK bit
                 // NOTE - Docunentation L.200->212
                 if tcp_header.ack() {
                     match self.state {
                         State::SynReceived => {
+                            // Documentation L.214->219
                             if is_between_wrapped(
                                 self.snd.una,
                                 seg_ack,
-                                self.snd.nxt.wrapping_sub(1),
+                                self.snd.nxt.wrapping_add(1),
                             ) {
-                                // If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
-                                // state and continue processing with the variables below
-                                // set to:
-                                //    SND.WND <- SEG.WND
-                                //    SND.WL1 <- SEG.SEQ
-                                //    SND.WL2 <- SEG.ACK
                                 self.state = State::Established;
                                 self.snd.wnd = tcp_header.window_size();
                                 self.snd.wl1 = seg_seq;
                                 self.snd.wl2 = seg_ack;
                             } else {
-                                // If the segment acknowledgment is not acceptable, form a
-                                // reset segment
-                                //     <SEQ=SEG.ACK><CTL=RST>
-                                // and send it.
-                                let mut response = self.get_tcp_header(seg_ack, 0);
+                                // Documentation L.221->224
+                                let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
                                 response.rst = true;
                                 let mut ip_header = self.get_ip_header(response.header_len());
                                 self.write(nic, &mut response, &mut ip_header, &[])?;
                             }
                         }
-                        State::Established => {
-                            // TODO
+                        State::Established
+                        | State::FinWait1
+                        | State::FinWait2
+                        | State::CloseWait
+                        | State::Closing => {
+                            if is_between_wrapped(
+                                self.snd.una,
+                                seg_ack,
+                                self.snd.nxt.wrapping_add(1),
+                            ) {
+                                // If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <-
+                                // SEG.ACK.  Any segments on the retransmission queue that
+                                // are thereby entirely acknowledged are removed.  Users
+                                // should receive positive acknowledgments for buffers that
+                                // have been SENT and fully acknowledged (i.e., SEND buffer
+                                // should be returned with "ok" response).
+                                self.snd.una = seg_ack;
+                                // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored.
+                                if seg_ack <= self.snd.una {
+                                    return Ok(());
+                                }
+                                // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
+                                // then send an ACK, drop the segment, and return.
+                                if seg_ack > self.snd.nxt {
+                                    let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
+                                    response.ack = true;
+                                    // TODO - What should we acknowledge?
+                                    response.acknowledgment_number = self.rcv.nxt;
+                                    let mut ip_header = self.get_ip_header(response.header_len());
+                                    self.write(nic, &mut response, &mut ip_header, &[])?;
+                                    return Ok(());
+                                }
+                            } else if is_between_wrapped(
+                                // If SND.UNA =< SEG.ACK =< SND.NXT, the send window should
+                                // be updated.
+                                self.snd.una.wrapping_sub(1),
+                                seg_ack,
+                                self.snd.nxt.wrapping_add(1),
+                            ) {
+                                // If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ
+                                // and SND.WL2 =< SEG.ACK)), set:
+                                // - SND.WND <- SEG.WND
+                                // - SND.WL1 <- SEG.SEQ
+                                // - SND.WL2 <- SEG.ACK
+                                if self.snd.wl1 < seg_seq
+                                    || (self.snd.wl1 == seg_seq && self.snd.wl2 <= seg_ack)
+                                {
+                                    self.snd.wnd = tcp_header.window_size();
+                                    self.snd.wl1 = seg_seq;
+                                    self.snd.wl2 = seg_ack;
+                                    // Note that SND.WND is an offset from SND.UNA, that SND.WL1
+                                    // records the sequence number of the last segment used to
+                                    // update SND.WND, and that SND.WL2 records the
+                                    // acknowledgment number of the last segment used to update
+                                    // SND.WND.  The check here prevents using old segments to
+                                    // update the window.
+                                }
+                            }
+                            if self.state == State::FinWait1 {
+                                // In addition to the processing for the ESTABLISHED state,
+                                // if the FIN segment is now acknowledged, then enter FIN-
+                                // WAIT-2 and continue processing in that state.
+                                if tcp_header.fin() {
+                                    self.state = State::FinWait2;
+                                }
+                            } else if self.state == State::FinWait2 {
+                                // In addition to the processing for the ESTABLISHED state,
+                                // if the retransmission queue is empty, the user's CLOSE
+                                // can be acknowledged ("ok") but do not delete the TCB.
+                                // TODO - Check retransmission queue
+                                println!("Check retransmission queue");
+                            } else if self.state == State::Closing {
+                                // In addition to the processing for the ESTABLISHED state,
+                                // if the ACK acknowledges our FIN, then enter the TIME-WAIT
+                                // state; otherwise, ignore the segment.
+                                // TODO - How to know if "the ACK acknowledges our FIN"?
+                                println!("Check if the ACK acknowledges our FIN");
+                            } else if self.state == State::LastAck {
+                                // The only thing that can arrive in this state is an
+                                // acknowledgment of our FIN.  If our FIN is now
+                                // acknowledged, delete the TCB, enter the CLOSED state, and
+                                // return.
+                                println!("Check if FIN is now acknowledged");
+                            } else if self.state == State::TimeWait {
+                                // The only thing that can arrive in this state is a
+                                // retransmission of the remote FIN.  Acknowledge it, and
+                                // restart the 2 MSL timeout.
+                            }
                         }
-                        _ => {
-                            unimplemented!();
+                        state => {
+                            unimplemented!("{state:?} processing not implemented");
                         }
                     }
                 } else {
                     return Ok(());
                 }
+                // TODO - Sixth step, check urgent bit
+                println!("Ignoring urgent bit for now");
+                // -  ESTABLISHED STATE
+                //
+                // -  FIN-WAIT-1 STATE
+                //
+                // -  FIN-WAIT-2 STATE
+                //
+                //    o  If the URG bit is set, RCV.UP <- max(RCV.UP,SEG.UP), and
+                //       signal the user that the remote side has urgent data if the
+                //       urgent pointer (RCV.UP) is in advance of the data consumed.
+                //       If the user has already been signaled (or is still in the
+                //       "urgent mode") for this continuous sequence of urgent data,
+                //       do not signal the user again.
+                //
+                // -  CLOSE-WAIT STATE
+                //
+                // -  CLOSING STATE
+                //
+                // -  LAST-ACK STATE
+                //
+                // -  TIME-WAIT STATE
+                //
+                //    o  This should not occur since a FIN has been received from the
+                //       remote side.  Ignore the URG.
+                //
+                //       -  ESTABLISHED STATE
+                //       -  FIN-WAIT-1 STATE
+                //       -  FIN-WAIT-2 STATE
+                if self.state == State::Established
+                    || self.state == State::FinWait1
+                    || self.state == State::FinWait2
+                {
+                    if !data.is_empty() {
+                        let msg = std::str::from_utf8(data).unwrap();
+                        println!("Data: {msg:?}");
+                        //          o  Once in the ESTABLISHED state, it is possible to deliver
+                        //             segment data to user RECEIVE buffers.  Data from segments
+                        //             can be moved into buffers until either the buffer is full or
+                        //             the segment is empty.  If the segment empties and carries a
+                        //             PUSH flag, then the user is informed, when the buffer is
+                        //             returned, that a PUSH has been received.
+                        //
+                        //          o  When the TCP endpoint takes responsibility for delivering
+                        //             the data to the user, it must also acknowledge the receipt
+                        //             of the data.
+                        //
+                        //          o  Once the TCP endpoint takes responsibility for the data, it
+                        //             advances RCV.NXT over the data accepted, and adjusts RCV.WND
+                        //             as appropriate to the current buffer availability.  The
+                        //             total of RCV.NXT and RCV.WND should not be reduced.
+                        self.rcv.nxt = self.rcv.nxt.wrapping_add(data.len() as u32);
+                        self.rcv.wnd = self.rcv.wnd.wrapping_sub(data.len() as u16);
+                        //          o  A TCP implementation MAY send an ACK segment acknowledging
+                        //             RCV.NXT when a valid segment arrives that is in the window
+                        //             but not at the left window edge (MAY-13).
+                        //
+                        //          o  Please note the window management suggestions in
+                        //             Section 3.8.
+                        //
+                        //          o  Send an acknowledgment of the form:
+                        //
+                        //             <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                        let mut response = self.get_tcp_header(self.snd.nxt, self.snd.wnd);
+                        response.ack = true;
+                        response.acknowledgment_number = self.rcv.nxt;
+                        let mut ip_header = self.get_ip_header(response.header_len());
+                        self.write(nic, &mut response, &mut ip_header, &[])?;
+                        //
+                        //          o  This acknowledgment should be piggybacked on a segment being
+                        //             transmitted if possible without incurring undue delay.
+                        //
+                    }
+                }
             }
         }
-
         Ok(())
     }
 }

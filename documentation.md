@@ -211,4 +211,14 @@ scaling) or may be hard-coded to a maximum permissible
 window value.  When the ACK value is acceptable, the per-
 state processing below applies:
 
+If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
+state and continue processing with the variables below
+set to:
+   SND.WND <- SEG.WND
+   SND.WL1 <- SEG.SEQ
+   SND.WL2 <- SEG.ACK
 
+If the segment acknowledgment is not acceptable, form a
+reset segment
+    <SEQ=SEG.ACK><CTL=RST>
+and send it.
