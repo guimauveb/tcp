@@ -8,7 +8,7 @@
 use {
     super::{error::Error, Socket, MTU},
     etherparse::{IpTrafficClass, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice},
-    std::io,
+    std::io::{self, Read},
     tun_tap::Iface,
 };
 
@@ -182,8 +182,6 @@ impl Default for RecvSequenceSpace {
     }
 }
 
-/// NOTE - In other words, you can shift things so that start = 0.
-/// The equation becomes a simple matter of comparison (x < end) with a small bit of fudging depending on which bounds you want to include (0 < x <= end, I think).
 // TODO - Test with some values
 fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
     lhs.wrapping_sub(rhs) > (1 << 31)
@@ -215,6 +213,8 @@ pub struct TransmissionControlBlock {
     rcv: RecvSequenceSpace,
     /// State from which the [TransmissionControlBlock](TransmissionControlBlock) was created.
     initial_state: InitialState,
+    // TODO - Temp
+    buffer: Vec<u8>,
 }
 
 impl TransmissionControlBlock {
@@ -244,10 +244,11 @@ impl TransmissionControlBlock {
         data: &[u8],
     ) -> io::Result<()> {
         // TODO - data can be > buf, handle backpressure/send queue.
-        //      (actually MTU - headers)
-        let payload_size = std::cmp::min(MTU, data.len());
-        if payload_size > MTU {
-            eprintln!("Payload size > MTU, handle backpressure");
+        let metadata = ip_header.header_len() + tcp_header.header_len() as usize;
+        let available_space = MTU - metadata;
+        let payload_size = std::cmp::min(available_space, data.len());
+        if payload_size > available_space {
+            eprintln!("Total payload size > MTU , handle backpressure");
         }
         // SND.NXT = next sequence number to be sent
         // 3.8 Data Communication
@@ -271,10 +272,9 @@ impl TransmissionControlBlock {
             .expect("Cannot compute checksum");
         let unwritten = {
             let mut unwritten = &mut buf[..];
-            // TODO - Handle error
             ip_header
                 .set_payload_len(tcp_header.header_len().into())
-                .expect("IP payload len too big");
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "IP payload too big"))?;
             ip_header
                 .write(&mut unwritten)
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "Cannot write ip header"))?;
@@ -302,6 +302,7 @@ impl TransmissionControlBlock {
             snd: SendSequenceSpace::default(),
             rcv: RecvSequenceSpace::default(),
             initial_state: InitialState::Active,
+            buffer: Vec::new(),
         };
         let mut tcp_header = tcb.get_tcp_header(tcb.snd.iss, tcb.snd.wnd);
         tcp_header.syn = true;
@@ -324,6 +325,7 @@ impl TransmissionControlBlock {
             snd: SendSequenceSpace::default(),
             rcv: RecvSequenceSpace::default(),
             initial_state: InitialState::Passive,
+            buffer: Vec::new(),
         })
     }
 
@@ -445,7 +447,7 @@ impl TransmissionControlBlock {
     pub fn on_segment<'segment>(
         &mut self,
         nic: &mut Iface,
-        ip_header: Ipv4HeaderSlice<'segment>,
+        _ip_header: Ipv4HeaderSlice<'segment>,
         tcp_header: TcpHeaderSlice<'segment>,
         data: &'segment [u8],
     ) -> Result<(), Error> {
@@ -588,6 +590,9 @@ impl TransmissionControlBlock {
                         //  TODO - If there are other controls or text in the segment, queue them
                         //  for processing after the ESTABLISHED state has been reached,
                         //  return.
+                        if !data.is_empty() {
+                            println!("Queue segment data for processing");
+                        }
 
                         // NOTE - Documentation L.110->117
                     }
@@ -685,15 +690,13 @@ impl TransmissionControlBlock {
                         // Documentation L.187->194
                         if tcp_header.syn() {
                             // XXX - What sequence number to use?
-                            let mut response = self.get_tcp_header(seg_ack, self.snd.wnd);
+                            let mut response = self.get_tcp_header(self.snd.nxt, self.snd.wnd);
                             response.rst = true;
                             let mut ip_header = self.get_ip_header(response.header_len());
                             self.write(nic, &mut response, &mut ip_header, &[])?;
                             return Err(Error::ConnectionReset);
                         }
                         // Documentation L.196->198
-
-                        // TODO - Check FIN bit
                     }
                     _ => {
                         unimplemented!();
@@ -739,11 +742,11 @@ impl TransmissionControlBlock {
                                 // should receive positive acknowledgments for buffers that
                                 // have been SENT and fully acknowledged (i.e., SEND buffer
                                 // should be returned with "ok" response).
-                                self.snd.una = seg_ack;
                                 // If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored.
                                 if seg_ack <= self.snd.una {
                                     return Ok(());
                                 }
+                                self.snd.una = seg_ack;
                                 // If the ACK acks something not yet sent (SEG.ACK > SND.NXT),
                                 // then send an ACK, drop the segment, and return.
                                 if seg_ack > self.snd.nxt {
@@ -820,7 +823,6 @@ impl TransmissionControlBlock {
                     return Ok(());
                 }
                 // TODO - Sixth step, check urgent bit
-                println!("Ignoring urgent bit for now");
                 // -  ESTABLISHED STATE
                 //
                 // -  FIN-WAIT-1 STATE
@@ -853,45 +855,51 @@ impl TransmissionControlBlock {
                     || self.state == State::FinWait2
                 {
                     if !data.is_empty() {
-                        let msg = std::str::from_utf8(data).unwrap();
-                        println!("Data: {msg:?}");
-                        //          o  Once in the ESTABLISHED state, it is possible to deliver
-                        //             segment data to user RECEIVE buffers.  Data from segments
-                        //             can be moved into buffers until either the buffer is full or
-                        //             the segment is empty.  If the segment empties and carries a
-                        //             PUSH flag, then the user is informed, when the buffer is
-                        //             returned, that a PUSH has been received.
+                        let mut reader = io::BufReader::new(data);
+                        reader.read_to_end(&mut self.buffer)?;
+                        // Once in the ESTABLISHED state, it is possible to deliver
+                        // segment data to user RECEIVE buffers.  Data from segments
+                        // can be moved into buffers until either the buffer is full or
+                        // the segment is empty.  If the segment empties and carries a
+                        // PUSH flag, then the user is informed, when the buffer is
+                        // returned, that a PUSH has been received.
                         //
-                        //          o  When the TCP endpoint takes responsibility for delivering
-                        //             the data to the user, it must also acknowledge the receipt
-                        //             of the data.
+                        // When the TCP endpoint takes responsibility for delivering
+                        // the data to the user, it must also acknowledge the receipt
+                        // of the data.
                         //
-                        //          o  Once the TCP endpoint takes responsibility for the data, it
-                        //             advances RCV.NXT over the data accepted, and adjusts RCV.WND
-                        //             as appropriate to the current buffer availability.  The
-                        //             total of RCV.NXT and RCV.WND should not be reduced.
+                        // Once the TCP endpoint takes responsibility for the data, it
+                        // advances RCV.NXT over the data accepted, and adjusts RCV.WND
+                        // as appropriate to the current buffer availability.  The
+                        // total of RCV.NXT and RCV.WND should not be reduced.
                         self.rcv.nxt = self.rcv.nxt.wrapping_add(data.len() as u32);
                         self.rcv.wnd = self.rcv.wnd.wrapping_sub(data.len() as u16);
-                        //          o  A TCP implementation MAY send an ACK segment acknowledging
-                        //             RCV.NXT when a valid segment arrives that is in the window
-                        //             but not at the left window edge (MAY-13).
+                        // A TCP implementation MAY send an ACK segment acknowledging
+                        // RCV.NXT when a valid segment arrives that is in the window
+                        // but not at the left window edge (MAY-13).
                         //
-                        //          o  Please note the window management suggestions in
-                        //             Section 3.8.
+                        // Please note the window management suggestions in
+                        // Section 3.8.
                         //
-                        //          o  Send an acknowledgment of the form:
+                        // Send an acknowledgment of the form:
                         //
-                        //             <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                        // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
                         let mut response = self.get_tcp_header(self.snd.nxt, self.snd.wnd);
                         response.ack = true;
                         response.acknowledgment_number = self.rcv.nxt;
                         let mut ip_header = self.get_ip_header(response.header_len());
                         self.write(nic, &mut response, &mut ip_header, &[])?;
-                        //
-                        //          o  This acknowledgment should be piggybacked on a segment being
-                        //             transmitted if possible without incurring undue delay.
-                        //
+                        // This acknowledgment should be piggybacked on a segment being
+                        // transmitted if possible without incurring undue delay.
                     }
+                } else if self.state == State::CloseWait
+                    || self.state == State::Closing
+                    || self.state == State::LastAck
+                    || self.state == State::TimeWait
+                {
+                    // This should not occur since a FIN has been received from the remote side.
+                    // Ignore the segment text.
+                    eprintln!("Code should not be reached since a FIN has been received from the remote side.");
                 }
             }
         }

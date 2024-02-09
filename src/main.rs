@@ -48,7 +48,6 @@ fn listen_remote(
         match TcpHeaderSlice::from_slice(&buf[ip_header_size..nbytes]) {
             Ok(tcp_header) => {
                 let data_offset = ip_header_size + tcp_header.slice().len();
-                println!("Data offset: {data_offset}");
                 let connection = Connection {
                     local: Socket {
                         address: ip_header.destination_addr(),
@@ -194,7 +193,7 @@ pub fn status(
 fn main() -> Result<(), Error> {
     let mut connections: HashMap<Connection, tcp::TransmissionControlBlock> = HashMap::default();
     let mut nic = Iface::without_packet_info("tun0", Mode::Tun)?;
-    let mut buf = [0u8; MTU + 4];
+    let mut buf = [0u8; MTU];
     let (local, remote) = (
         Socket {
             address: Ipv4Addr::new(192, 168, 0, 2),
