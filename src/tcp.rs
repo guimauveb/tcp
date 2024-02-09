@@ -1,10 +1,3 @@
-// NOTE - When the tcp segment is not properly routed (wrong destination port), the remote instance sends a RST with SEQ == ACK
-//        3 0.475377651  192.168.0.1 → 192.168.0.2  TCP 64 35688 → 5355 [SYN] Seq=0 Win=64240 Len=0 MSS=1460 SACK_PERM TSval=2418554181 TSecr=0 WS=128 TFO=R
-//        4 0.475390621  192.168.0.2 → 192.168.0.1  TCP 40 35688 → 5355 [SYN, ACK] Seq=0 Ack=1 Win=10 Len=0
-//        5 0.475399731  192.168.0.1 → 192.168.0.2  TCP 40 5355 → 35688 [RST] Seq=1 Win=0 Len=0
-//
-//      - Check "Initial sequence number selecton" paragraph from RFC9293.
-
 use {
     super::{error::Error, Socket, MTU},
     etherparse::{
