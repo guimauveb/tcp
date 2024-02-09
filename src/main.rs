@@ -34,7 +34,7 @@ fn listen_remote(
     connections: &mut HashMap<Connection, TransmissionControlBlock>,
 ) -> Result<(), Error> {
     //nic.set_non_blocking()?;
-    // TODO - Match errors
+    // TODO - Handle errors
     let Ok(nbytes) = nic.recv(buf) else {
         return Ok(());
     };
@@ -68,7 +68,7 @@ fn listen_remote(
                                 Error::ConnectionRefused | Error::ConnectionReset => {
                                     entry.remove_entry();
                                 }
-                                _ => {
+                                err => {
                                     eprintln!("{err}");
                                 }
                             }
@@ -108,7 +108,7 @@ pub fn listen(
     Ok(())
 }
 
-/// Active connection, we want to initate a connection.
+/// Create a active connection, we want to initate a connection.
 pub fn connect(
     nic: &mut Iface,
     local: Socket,
