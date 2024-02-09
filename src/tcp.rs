@@ -12,7 +12,7 @@ use {
     },
     std::{
         fs::File,
-        io::{self, BufWriter, Read, Write},
+        io::{self, BufWriter, Write},
     },
     tun_tap::Iface,
 };
@@ -28,20 +28,12 @@ const TTL: u8 = 60;
 /// 1).
 type Window = u16;
 
-///     Kind     Length    Meaning
-///     ----     ------    -------
-///      0         -       End of option list.
-///      1         -       No-Operation.
-///      2         4       Maximum Segment Size.
-///
-#[derive(Debug)]
-enum Options {
-    /// End of option list.
-    EndOfOptionList,
-    /// No-Operation
-    NoOp,
-    /// Maximum Segment size
-    MaxSegmentSize,
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    lhs.wrapping_sub(rhs) > (1 << 31)
+}
+
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,16 +83,6 @@ impl State {
     }
 }
 
-#[derive(Debug)]
-enum UserCall {
-    Open,
-    Send,
-    Receive,
-    Close,
-    Abort,
-    Status,
-}
-
 /// State of the Send Sequence Space (RFC 793 S3.2 F4)
 /// The following diagrams may help to relate some of these variables to
 /// the sequence space.
@@ -143,7 +125,7 @@ impl Default for SendSequenceSpace {
             iss,
             una: iss,
             nxt: iss + 1,
-            wnd: 65535,
+            wnd: u16::MAX,
             up: false,
             wl1: 0,
             wl2: 0,
@@ -180,20 +162,11 @@ impl Default for RecvSequenceSpace {
     fn default() -> Self {
         Self {
             nxt: 0,
-            wnd: 65535,
+            wnd: u16::MAX,
             up: false,
             irs: 0,
         }
     }
-}
-
-// TODO - Test with some values
-fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
-    lhs.wrapping_sub(rhs) > (1 << 31)
-}
-
-fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    wrapping_lt(start, x) && wrapping_lt(x, end)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -361,33 +334,6 @@ impl TransmissionControlBlock {
         self.write(nic, &mut tcp_header, &mut ip_header, data)?;
 
         Ok(())
-    }
-
-    // There are essentially three cases:
-    //   1) The user initiates by telling the TCP to CLOSE the connection
-    //   2) The remote TCP initiates by sending a FIN control signal
-    //   3) Both users CLOSE simultaneously
-    fn close<'segment>(
-        &mut self,
-        nic: &mut Iface,
-        tcp_header: TcpHeaderSlice<'segment>,
-        ip_header: Ipv4HeaderSlice<'segment>,
-    ) {
-        let mut fin = TcpHeader::new(self.local.port, self.remote.port, 0, 0);
-        fin.fin = true;
-        // Case 1:  Local user initiates the close
-
-        //   In this case, a FIN segment can be constructed and placed on the
-        //   outgoing segment queue.  No further SENDs from the user will be
-        //   accepted by the TCP, and it enters the FIN-WAIT-1 state.  RECEIVEs
-        //   are allowed in this state.  All segments preceding and including FIN
-        //   will be retransmitted until acknowledged.  When the other TCP has
-        //   both acknowledged the FIN and sent a FIN of its own, the first TCP
-        //   can ACK this FIN.  Note that a TCP receiving a FIN will ACK but not
-        //   send its own FIN until its user has CLOSED the connection also.
-        self.state = State::FinWait1;
-
-        unimplemented!("Close not implemented");
     }
 
     /// RFC9293 3.10.7.4.  Other States
@@ -842,7 +788,9 @@ impl TransmissionControlBlock {
                     // advances RCV.NXT over the data accepted, and adjusts RCV.WND
                     // as appropriate to the current buffer availability.  The
                     // total of RCV.NXT and RCV.WND should not be reduced.
-                    self.rcv.nxt = self.rcv.nxt.wrapping_add(data.len() as u32);
+                    // NOTE - SEG.SEQ+SEG.LEN-1 = last sequence number of a segment, so SEG.SEQ+SEG.LEN is the next byte we expect.
+                    self.rcv.nxt = seg_seq.wrapping_add(seg_len);
+                    // TODO - Take buffer availability into account
                     self.rcv.wnd = self.rcv.wnd.wrapping_sub(data.len() as u16);
                     // A TCP implementation MAY send an ACK segment acknowledging
                     // RCV.NXT when a valid segment arrives that is in the window
