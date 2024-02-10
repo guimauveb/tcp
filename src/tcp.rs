@@ -274,7 +274,8 @@ impl TransmissionControlBlock {
             snd: SendSequenceSpace::default(),
             rcv: RecvSequenceSpace::default(),
             initial_state: InitialState::Active,
-            buffer: BufWriter::new(File::create("/home/guimauve/cs/tcp/ticks.szl")?),
+            // TODO - Buffers will be passed to the send/recv methods
+            buffer: BufWriter::new(File::create("tcp_data")?),
         };
         let mut tcp_header = tcb.get_tcp_header(tcb.snd.iss, tcb.snd.wnd);
         tcp_header.syn = true;
@@ -297,7 +298,8 @@ impl TransmissionControlBlock {
             snd: SendSequenceSpace::default(),
             rcv: RecvSequenceSpace::default(),
             initial_state: InitialState::Passive,
-            buffer: BufWriter::new(File::create("/home/guimauve/cs/tcp/ticks.szl")?),
+            // TODO - Buffers will be passed to the send/recv methods
+            buffer: BufWriter::new(File::create("tcp_data")?),
         })
     }
 

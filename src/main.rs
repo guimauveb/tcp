@@ -1,5 +1,5 @@
-#[allow(dead_code)]
 // TODO - Use ef_vi
+#[allow(dead_code)]
 mod error;
 mod tcp;
 
@@ -33,8 +33,6 @@ fn listen_remote(
     buf: &mut [u8],
     connections: &mut HashMap<Connection, TransmissionControlBlock>,
 ) -> Result<(), Error> {
-    //nic.set_non_blocking()?;
-    // TODO - Handle errors
     let Ok(nbytes) = nic.recv(buf) else {
         return Ok(());
     };
@@ -215,6 +213,7 @@ fn main() -> Result<(), Error> {
 }
 
 // TODO - Test against proven TCP implementation
+//      - Try sending segments out of order
 #[cfg(test)]
 mod tests {
     use {
