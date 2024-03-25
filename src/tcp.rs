@@ -240,7 +240,7 @@ impl TransmissionControlBlock {
         let mut buf = [0u8; MTU];
         // NOTE - Netcat does not ACK the SYN ACK message if the checksum is not set
         tcp_header.checksum = tcp_header
-            .calc_checksum_ipv4(&ip_header, &data[..payload_size])
+            .calc_checksum_ipv4(ip_header, &data[..payload_size])
             .expect("Cannot compute checksum");
         let unwritten = {
             let mut unwritten = &mut buf[..];
@@ -361,9 +361,8 @@ impl TransmissionControlBlock {
             if rcv_wnd == 0 && seg_seq != rcv_nxt {
                 eprintln!("Unacceptable segment: test case 1 failed");
                 return false;
-            } else if rcv_wnd > 0
-                && !is_between_wrapped(rcv_nxt.wrapping_sub(1), seg_seq, rcv_nxt_wnd)
-            {
+            }
+            if rcv_wnd > 0 && !is_between_wrapped(rcv_nxt.wrapping_sub(1), seg_seq, rcv_nxt_wnd) {
                 eprintln!("Unacceptable segment: test case 2 failed");
                 return false;
             }
@@ -371,7 +370,8 @@ impl TransmissionControlBlock {
             if rcv_wnd == 0 {
                 eprintln!("Unacceptable segment: test case 3");
                 return false;
-            } else if rcv_wnd > 0
+            }
+            if rcv_wnd > 0
                 && !(is_between_wrapped(rcv_nxt.wrapping_sub(1), seg_seq, rcv_nxt_wnd)
                     || is_between_wrapped(
                         rcv_nxt.wrapping_sub(1),
